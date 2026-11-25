@@ -2,9 +2,12 @@ import express, { type Request, type Response } from 'express';
 import { createServer } from 'node:http';
 import { config } from './config.js';
 import { getDb } from './db.js';
-import { getRedis, waitRedisReady } from './redis.js';
+import { waitRedisReady } from './redis.js';
+import { loadSession } from './middleware/session.js';
 import { webhookRouter } from './routes/webhooks.js';
 import { graderRouter } from './routes/grader.js';
+import { authRouter } from './routes/auth.js';
+import { apiRouter } from './routes/api.js';
 import { attachWss } from './lib/ws.js';
 import { startOutboxWorker } from './lib/outbox.js';
 
@@ -13,8 +16,9 @@ const app = express();
 // ─── 1. Raw body capture for Pigeon webhook (MUST be before express.json) ────
 app.use('/webhooks/pigeon', express.raw({ type: '*/*' }));
 
-// ─── 2. Global JSON parser for all other routes ───────────────────────────────
+// ─── 2. Global JSON parser + session loader for all other routes ──────────────
 app.use(express.json());
+app.use(loadSession);
 
 // ─── 3. Healthcheck — only 200 after both stores are ready ───────────────────
 let ready = false;
@@ -30,6 +34,8 @@ app.get('/healthz', (_req: Request, res: Response) => {
 // ─── 4. Routes ────────────────────────────────────────────────────────────────
 app.use('/', webhookRouter);
 app.use('/__grader', graderRouter);
+app.use('/auth', authRouter);
+app.use('/api', apiRouter);
 
 // ─── 5. HTTP server + WebSocket ───────────────────────────────────────────────
 const server = createServer(app);

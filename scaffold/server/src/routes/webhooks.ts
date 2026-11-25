@@ -1,9 +1,8 @@
 import crypto from 'node:crypto';
 import { Router, type Request, type Response } from 'express';
 import { getDb } from '../db.js';
-import { getRedis } from '../redis.js';
 import { config, KNOWN_WORKSPACES } from '../config.js';
-import { publishWsEvent } from '../lib/ws.js';
+import { publishWorkspaceEvent } from '../lib/ws.js';
 
 export const webhookRouter = Router();
 
@@ -194,7 +193,17 @@ async function handleInbound(
   );
 
   // Publish WebSocket event to all instances
-  await publishInboundEvent(workspace, from, messageId);
+  try {
+    await publishWorkspaceEvent(workspace, {
+      type: 'message.inbound',
+      contact: from,
+      message_id: messageId,
+      text: text ?? '',
+      occurred_at: occurredAt.toISOString(),
+    });
+  } catch {
+    // Non-fatal
+  }
 
   res.status(200).json({ ok: true });
 }
@@ -245,7 +254,16 @@ async function handleStatus(
     );
 
     // Publish WS event for status change
-    await publishStatusEvent(workspace, outbound['contact'] as string, clientRef, newStatus);
+    try {
+      await publishWorkspaceEvent(workspace, {
+        type: 'message.status',
+        contact: outbound['contact'] as string,
+        client_ref: clientRef,
+        status: newStatus,
+      });
+    } catch {
+      // Non-fatal
+    }
   }
 
   res.status(200).json({ ok: true });
@@ -265,53 +283,4 @@ function getStatusesBelowRank(rank: number): string[] {
   return Object.entries(STATUS_RANK)
     .filter(([, r]) => r < rank)
     .map(([s]) => s);
-}
-
-async function publishInboundEvent(
-  workspace: string,
-  contact: string,
-  messageId: string,
-): Promise<void> {
-  try {
-    const redis = getRedis();
-    // Assign a workspace-scoped sequence number
-    const seq = await redis.incr(`seq:${workspace}`);
-    const frame = JSON.stringify({
-      seq,
-      type: 'message.inbound',
-      contact,
-      message_id: messageId,
-    });
-    // Store in Redis stream for replay (keep 10k events per workspace)
-    await redis.xadd(`stream:${workspace}`, '*', 'seq', String(seq), 'frame', frame);
-    // Pub/sub fan-out to all instances' WebSocket clients
-    await redis.publish(`ws:pub:${workspace}`, frame);
-    await publishWsEvent(workspace, frame);
-  } catch {
-    // Non-fatal — WS delivery is best-effort at this layer
-  }
-}
-
-async function publishStatusEvent(
-  workspace: string,
-  contact: string,
-  clientRef: string,
-  status: string,
-): Promise<void> {
-  try {
-    const redis = getRedis();
-    const seq = await redis.incr(`seq:${workspace}`);
-    const frame = JSON.stringify({
-      seq,
-      type: 'message.status',
-      contact,
-      client_ref: clientRef,
-      status,
-    });
-    await redis.xadd(`stream:${workspace}`, '*', 'seq', String(seq), 'frame', frame);
-    await redis.publish(`ws:pub:${workspace}`, frame);
-    await publishWsEvent(workspace, frame);
-  } catch {
-    // Non-fatal
-  }
 }

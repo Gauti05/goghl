@@ -28,10 +28,11 @@ graderRouter.post('/reset', async (_req: Request, res: Response) => {
     db.collection('messages').deleteMany({}),
     db.collection('outbound').deleteMany({}),
     db.collection('conversations').deleteMany({}),
+    db.collection('notes').deleteMany({}),
   ]);
 
   // Delete application keys from Redis (keep session keys)
-  const patterns = ['seq:*', 'stream:*', 'rate:*', 'cooloff:*', 'ws:pub:*', 'claim:*'];
+  const patterns = ['seq:*', 'events:*', 'stream:*', 'rate:*', 'cooloff:*', 'ws:pub:*', 'claim:*'];
   for (const pattern of patterns) {
     const keys = await redis.keys(pattern);
     if (keys.length > 0) {

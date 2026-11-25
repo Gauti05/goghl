@@ -33,4 +33,7 @@ async function ensureIndexes(db: Db): Promise<void> {
   await db.collection('outbound').createIndex({ clientRef: 1 }, { unique: true });
   await db.collection('outbound').createIndex({ status: 1, nextAttemptAt: 1 });
   await db.collection('outbound').createIndex({ workspace: 1, status: 1 });
+
+  // notes — encrypted private notes per conversation
+  await db.collection('notes').createIndex({ workspace: 1, contact: 1, createdAt: 1 });
 }

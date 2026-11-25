@@ -10,7 +10,7 @@
 import { getDb } from '../db.js';
 import { getRedis } from '../redis.js';
 import { config, KNOWN_WORKSPACES } from '../config.js';
-import { publishWsEvent } from './ws.js';
+import { publishWorkspaceEvent } from './ws.js';
 
 export class OutboxError extends Error {
   constructor(
@@ -286,18 +286,12 @@ async function upgradeStatus(
   if (result.modifiedCount > 0) {
     // Publish WS status event
     try {
-      const redis = getRedis();
-      const seq = await redis.incr(`seq:${workspace}`);
-      const frame = JSON.stringify({
-        seq,
+      await publishWorkspaceEvent(workspace, {
         type: 'message.status',
         contact,
         client_ref: clientRef,
         status: newStatus,
       });
-      await redis.xadd(`stream:${workspace}`, '*', 'seq', String(seq), 'frame', frame);
-      await redis.publish(`ws:pub:${workspace}`, frame);
-      await publishWsEvent(workspace, frame);
     } catch {
       // Non-fatal
     }
