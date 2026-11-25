@@ -25,7 +25,8 @@ export const config = {
     } as Record<string, string>,
   },
   oidc: {
-    issuer: env('OIDC_ISSUER', 'http://localhost:4020'),
+    issuer: process.env.OIDC_ISSUER || process.env.IDP_URL || 'http://localhost:4020',
+    idpUrl: process.env.IDP_URL || process.env.OIDC_ISSUER || 'http://localhost:4020',
     clientId: env('OIDC_CLIENT_ID', 'switchboard-web'),
     clientSecret: env('OIDC_CLIENT_SECRET', 'dev-secret-not-for-production'),
     redirectUri: env('OIDC_REDIRECT_URI', 'http://localhost:4000/auth/callback'),

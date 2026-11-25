@@ -120,7 +120,7 @@ async function processOnce(): Promise<boolean> {
   const db = await getDb();
   const now = new Date();
 
-  // Atomically claim one due job — query and update by clientRef-based filter
+  // Atomically claim one due job with an 8s lease for fast dead-worker failover
   const job = await db.collection('outbound').findOneAndUpdate(
     {
       $or: [
@@ -131,9 +131,8 @@ async function processOnce(): Promise<boolean> {
     {
       $set: {
         status: 'processing',
-        lockedUntil: new Date(Date.now() + 15_000),
+        lockedUntil: new Date(Date.now() + 8_000),
       },
-      $inc: { attempts: 1 },
     },
     { returnDocument: 'after', sort: { nextAttemptAt: 1 } },
   );
@@ -144,27 +143,9 @@ async function processOnce(): Promise<boolean> {
 
   const redis = getRedis();
 
-  // Check workspace-level rate-limit cooloff (set when Pigeon returns 429)
-  const cooloffTs = await redis.get(`cooloff:${workspace}`);
-  if (cooloffTs && parseInt(cooloffTs, 10) > Date.now()) {
-    // Release job back to queued, schedule after cooloff
-    await db.collection('outbound').updateOne(
-      { clientRef, status: 'processing' },
-      {
-        $set: {
-          status: 'queued',
-          lockedUntil: null,
-          nextAttemptAt: new Date(parseInt(cooloffTs, 10)),
-        },
-      },
-    );
-    return true;
-  }
-
-  // Check + consume a token from the per-workspace bucket (atomic Lua)
+  // Check + consume a token from the per-workspace bucket AND check cooloff atomically
   const apiKey = config.pigeon.apiKeys[workspace];
   if (!apiKey) {
-    // No key for workspace — permanent failure
     await db.collection('outbound').updateOne(
       { clientRef, status: 'processing' },
       { $set: { status: 'failed', lockedUntil: null, updatedAt: new Date() } },
@@ -172,16 +153,19 @@ async function processOnce(): Promise<boolean> {
     return true;
   }
 
-  const tokenAvailable = await consumeToken(redis, workspace);
-  if (!tokenAvailable) {
-    // Rate limited locally — retry after a short wait
+  const gate = await consumeTokenOrCooloff(redis, workspace);
+  if (gate.blocked) {
+    // Cooloff or rate-limited — release cleanly without incrementing attempts
+    const delayMs = gate.cooloffUntilMs > Date.now()
+      ? gate.cooloffUntilMs - Date.now() + 50
+      : 250;
     await db.collection('outbound').updateOne(
       { clientRef, status: 'processing' },
       {
         $set: {
           status: 'queued',
           lockedUntil: null,
-          nextAttemptAt: new Date(Date.now() + 250),
+          nextAttemptAt: new Date(Date.now() + delayMs),
         },
       },
     );
@@ -212,26 +196,26 @@ async function processOnce(): Promise<boolean> {
     const sendStatus = resp?.status ?? 0;
 
     if (sendStatus === 200) {
-      // Only upgrade if still at a rank below 'sent'
       await upgradeStatus(db, clientRef, 'sent', workspace, contact);
     } else if (sendStatus === 429) {
-      // Respect Retry-After header — wait the full cooloff before retrying
       const retryAfterSec = parseInt(resp?.headers.get('retry-after') ?? '2', 10);
       const retryAfterMs = Math.max(retryAfterSec, 1) * 1000;
-      await redis.set(`cooloff:${workspace}`, String(Date.now() + retryAfterMs), 'PX', retryAfterMs + 500);
+      const cooloffUntil = Date.now() + retryAfterMs;
+      await redis.set(`cooloff:${workspace}`, String(cooloffUntil), 'PX', retryAfterMs + 500);
+      await redis.hset(`rate:${workspace}`, 'tokens', '0', 'at', String(Date.now()));
       await db.collection('outbound').updateOne(
         { clientRef, status: 'processing' },
         {
           $set: {
             status: 'queued',
             lockedUntil: null,
-            nextAttemptAt: new Date(Date.now() + retryAfterMs),
+            nextAttemptAt: new Date(cooloffUntil + 50),
           },
+          $inc: { attempts: 1 },
         },
       );
     } else {
-      // 503 or other — exponential backoff
-      const backoffMs = Math.min(2_000, 300 * 2 ** Math.min(attempts - 1, 6));
+      const backoffMs = Math.min(2_000, 300 * 2 ** Math.min(attempts, 6));
       await db.collection('outbound').updateOne(
         { clientRef, status: 'processing' },
         {
@@ -240,13 +224,12 @@ async function processOnce(): Promise<boolean> {
             lockedUntil: null,
             nextAttemptAt: new Date(Date.now() + backoffMs),
           },
+          $inc: { attempts: 1 },
         },
       );
     }
   } catch {
-    // Network error / timeout — only revert to queued if still processing
-    // (if Pigeon accepted-slow and already sent a status webhook, don't overwrite it)
-    const backoffMs = Math.min(2_000, 300 * 2 ** Math.min(attempts - 1, 6));
+    const backoffMs = Math.min(2_000, 300 * 2 ** Math.min(attempts, 6));
     await db.collection('outbound').updateOne(
       { clientRef, status: 'processing' },
       {
@@ -255,6 +238,7 @@ async function processOnce(): Promise<boolean> {
           lockedUntil: null,
           nextAttemptAt: new Date(Date.now() + backoffMs),
         },
+        $inc: { attempts: 1 },
       },
     ).catch(() => {});
   }
@@ -310,41 +294,50 @@ async function upgradeStatus(
  * Returns 1 if token consumed, 0 if rate-limited.
  */
 const TOKEN_BUCKET_LUA = `
-local key = KEYS[1]
+local rateKey = KEYS[1]
+local cooloffKey = KEYS[2]
 local now = tonumber(ARGV[1])
 local capacity = 8
 local refillRate = 4
 local ttl = 5000
 
-local data = redis.call('HMGET', key, 'tokens', 'at')
+local cooloff = tonumber(redis.call('GET', cooloffKey) or '0')
+if cooloff > now then
+  return {0, cooloff}
+end
+
+local data = redis.call('HMGET', rateKey, 'tokens', 'at')
 local tokens = tonumber(data[1]) or capacity
 local at = tonumber(data[2]) or now
 
-local elapsed = (now - at) / 1000
+local elapsed = math.max(0, (now - at) / 1000)
 tokens = math.min(capacity, tokens + elapsed * refillRate)
 
 if tokens < 1 then
-  redis.call('HMSET', key, 'tokens', tokens, 'at', now)
-  redis.call('PEXPIRE', key, ttl)
-  return 0
+  redis.call('HMSET', rateKey, 'tokens', tokens, 'at', now)
+  redis.call('PEXPIRE', rateKey, ttl)
+  return {0, 0}
 end
 
 tokens = tokens - 1
-redis.call('HMSET', key, 'tokens', tokens, 'at', now)
-redis.call('PEXPIRE', key, ttl)
-return 1
+redis.call('HMSET', rateKey, 'tokens', tokens, 'at', now)
+redis.call('PEXPIRE', rateKey, ttl)
+return {1, 0}
 `;
 
-async function consumeToken(
+async function consumeTokenOrCooloff(
   redis: ReturnType<typeof getRedis>,
   workspace: string,
-): Promise<boolean> {
-  const result = await (
+): Promise<{ blocked: boolean; cooloffUntilMs: number }> {
+  const res = await (
     redis as unknown as {
-      eval: (script: string, numkeys: number, ...args: (string | number)[]) => Promise<number>;
+      eval: (script: string, numkeys: number, ...args: (string | number)[]) => Promise<[number, number]>;
     }
-  ).eval(TOKEN_BUCKET_LUA, 1, `rate:${workspace}`, Date.now());
-  return result === 1;
+  ).eval(TOKEN_BUCKET_LUA, 2, `rate:${workspace}`, `cooloff:${workspace}`, Date.now());
+  return {
+    blocked: res[0] !== 1,
+    cooloffUntilMs: Number(res[1] ?? 0),
+  };
 }
 
 function isDuplicateKeyError(err: unknown): boolean {
@@ -361,6 +354,6 @@ export function startOutboxWorker(): void {
   // Run immediately on startup to pick up any queued jobs from before crash
   void processOutbox();
 
-  // Polling interval — catches jobs whose nextAttemptAt comes due
-  setInterval(() => void processOutbox(), 200);
+  // Polling interval — catches jobs whose nextAttemptAt or expired lease comes due
+  setInterval(() => void processOutbox(), 150);
 }

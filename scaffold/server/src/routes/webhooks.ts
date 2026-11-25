@@ -106,38 +106,48 @@ webhookRouter.post('/webhooks/pigeon', async (req: Request, res: Response) => {
 
   const db = await getDb();
 
-  // 8. Deduplicate by event.id (atomic insert; duplicate key = already processed)
+  // 8. Fast-path check if event.id was already fully processed
+  const existingEvent = await db.collection('events').findOne({ eventId });
+  if (existingEvent) {
+    res.status(200).json({ ok: true });
+    return;
+  }
+
+  // 9. Process event first, then record event.id so a mid-request crash never
+  //    causes Pigeon's retry to be falsely skipped as a duplicate.
+  if (eventType === 'message.inbound') {
+    await handleInbound(db, event, eventId, workspace, res);
+  } else if (eventType === 'message.status') {
+    await handleStatus(db, event, eventId, workspace, res);
+  } else {
+    await recordEvent(db, eventId, eventType, workspace);
+    res.status(200).json({ ok: true });
+  }
+});
+
+async function recordEvent(
+  db: Awaited<ReturnType<typeof getDb>>,
+  eventId: string,
+  type: string,
+  workspace: string,
+): Promise<void> {
   try {
     await db.collection('events').insertOne({
       eventId,
-      type: eventType,
+      type,
       workspace,
       processedAt: new Date(),
     });
   } catch (err: unknown) {
-    if (isDuplicateKeyError(err)) {
-      // Already processed — idempotent 200
-      res.status(200).json({ ok: true });
-      return;
-    }
-    throw err;
+    if (!isDuplicateKeyError(err)) throw err;
   }
-
-  // 9. Handle known event types
-  if (eventType === 'message.inbound') {
-    await handleInbound(db, event, workspace, res);
-  } else if (eventType === 'message.status') {
-    await handleStatus(db, event, workspace, res);
-  } else {
-    // Unknown type — 200, ignore (Pigeon adds types without notice)
-    res.status(200).json({ ok: true });
-  }
-});
+}
 
 // ─── Inbound message ─────────────────────────────────────────────────────────
 async function handleInbound(
   db: Awaited<ReturnType<typeof getDb>>,
   event: Record<string, unknown>,
+  eventId: string,
   workspace: string,
   res: Response,
 ): Promise<void> {
@@ -160,6 +170,7 @@ async function handleInbound(
   const occurredAt = new Date(occurredAtStr);
 
   // Deduplicate by message_id
+  let isNewMessage = true;
   try {
     await db.collection('messages').insertOne({
       messageId,
@@ -172,10 +183,10 @@ async function handleInbound(
     });
   } catch (err: unknown) {
     if (isDuplicateKeyError(err)) {
-      res.status(200).json({ ok: true });
-      return;
+      isNewMessage = false;
+    } else {
+      throw err;
     }
-    throw err;
   }
 
   // Upsert conversation — $setOnInsert only on creation, $max for updatedAt
@@ -192,19 +203,22 @@ async function handleInbound(
     { upsert: true },
   );
 
-  // Publish WebSocket event to all instances
-  try {
-    await publishWorkspaceEvent(workspace, {
-      type: 'message.inbound',
-      contact: from,
-      message_id: messageId,
-      text: text ?? '',
-      occurred_at: occurredAt.toISOString(),
-    });
-  } catch {
-    // Non-fatal
+  // Publish WebSocket event to all instances (only for newly stored messages)
+  if (isNewMessage) {
+    try {
+      await publishWorkspaceEvent(workspace, {
+        type: 'message.inbound',
+        contact: from,
+        message_id: messageId,
+        text: text ?? '',
+        occurred_at: occurredAt.toISOString(),
+      });
+    } catch {
+      // Non-fatal
+    }
   }
 
+  await recordEvent(db, eventId, 'message.inbound', workspace);
   res.status(200).json({ ok: true });
 }
 
@@ -212,11 +226,13 @@ async function handleInbound(
 async function handleStatus(
   db: Awaited<ReturnType<typeof getDb>>,
   event: Record<string, unknown>,
+  eventId: string,
   workspace: string,
   res: Response,
 ): Promise<void> {
   const data = event['data'] as Record<string, unknown> | undefined;
   if (!data) {
+    await recordEvent(db, eventId, 'message.status', workspace);
     res.status(200).json({ ok: true });
     return;
   }
@@ -225,13 +241,14 @@ async function handleStatus(
   const newStatus = data['status'] as string | undefined;
 
   if (!clientRef || !newStatus) {
+    await recordEvent(db, eventId, 'message.status', workspace);
     res.status(200).json({ ok: true });
     return;
   }
 
   const newRank = STATUS_RANK[newStatus];
   if (newRank === undefined) {
-    // Unknown status string — ignore
+    await recordEvent(db, eventId, 'message.status', workspace);
     res.status(200).json({ ok: true });
     return;
   }
@@ -239,33 +256,35 @@ async function handleStatus(
   // Find existing outbound record
   const outbound = await db.collection('outbound').findOne({ clientRef });
   if (!outbound) {
-    // Unknown client_ref — ignore per spec
+    await recordEvent(db, eventId, 'message.status', workspace);
     res.status(200).json({ ok: true });
     return;
   }
 
   const currentRank = STATUS_RANK[outbound['status'] as string] ?? 0;
 
-  // Only upgrade if new status has higher or equal rank (never downgrade)
+  // Only upgrade if new status has higher rank (never downgrade)
   if (newRank > currentRank) {
-    await db.collection('outbound').updateOne(
+    const upd = await db.collection('outbound').updateOne(
       { clientRef, status: { $in: getStatusesBelowRank(newRank) } },
       { $set: { status: newStatus, updatedAt: new Date() } },
     );
 
-    // Publish WS event for status change
-    try {
-      await publishWorkspaceEvent(workspace, {
-        type: 'message.status',
-        contact: outbound['contact'] as string,
-        client_ref: clientRef,
-        status: newStatus,
-      });
-    } catch {
-      // Non-fatal
+    if (upd.modifiedCount > 0) {
+      try {
+        await publishWorkspaceEvent(workspace, {
+          type: 'message.status',
+          contact: outbound['contact'] as string,
+          client_ref: clientRef,
+          status: newStatus,
+        });
+      } catch {
+        // Non-fatal
+      }
     }
   }
 
+  await recordEvent(db, eventId, 'message.status', workspace);
   res.status(200).json({ ok: true });
 }
 
