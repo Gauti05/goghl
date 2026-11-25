@@ -15,6 +15,7 @@ export const config = {
   mongoUrl: env('MONGO_URL', 'mongodb://localhost:27017/switchboard'),
   redisUrl: env('REDIS_URL', 'redis://localhost:6379'),
   elasticsearchUrl: env('ELASTICSEARCH_URL', 'http://localhost:9200'),
+  sessionSecret: env('SESSION_SECRET', 'switchboard-session-secret-dev'),
   pigeon: {
     url: env('PIGEON_URL', 'http://localhost:4010'),
     webhookSecret: env('PIGEON_WEBHOOK_SECRET', 'whsec_pigeon_dev'),
@@ -36,3 +37,6 @@ export const config = {
     webhookSecret: env('PAYBOX_WEBHOOK_SECRET', 'whsec_paybox_dev'),
   },
 };
+
+/** Set of workspace IDs whose Pigeon API key is known. */
+export const KNOWN_WORKSPACES = new Set(Object.keys(config.pigeon.apiKeys));
