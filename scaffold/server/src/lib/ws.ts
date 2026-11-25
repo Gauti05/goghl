@@ -3,10 +3,11 @@
  *
  * - Authenticates upgrade requests via the Redis session cookie and checks
  *   workspace membership (401 / 403 before upgrade).
+ * - Awaits Redis `psubscribe('ws:pub:*')` before upgrading any socket.
  * - Uses Redis INCR `seq:{workspace}` + ZADD `events:{workspace}` + PUBLISH `ws:pub:{workspace}`
  *   so all server copies share monotonic sequence numbers and replay history.
- * - On connection with `?after=N`, subscribes first & buffers live messages while
- *   reading history from `events:{workspace}`, then flushes without gaps or duplicates.
+ * - On connection with `?after=N`, registers synchronously and buffers live messages
+ *   while reading history from `events:{workspace}`, then flushes without gaps or duplicates.
  */
 import type { IncomingMessage, Server } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -21,7 +22,6 @@ interface ClientState {
   lastSentSeq: number;
 }
 
-// Local registry: workspace -> Set of connected client states
 const rooms = new Map<string, Set<ClientState>>();
 
 function joinRoom(client: ClientState): void {
@@ -40,11 +40,6 @@ function leaveRoom(client: ClientState): void {
   if (set.size === 0) rooms.delete(client.workspace);
 }
 
-/**
- * Publish a workspace event across all server instances.
- * Assigns a monotonic `seq`, stores in Redis sorted set for `?after=` replay,
- * and publishes to `ws:pub:{workspace}`.
- */
 export async function publishWorkspaceEvent(
   workspace: string,
   frameWithoutSeq: Record<string, unknown>,
@@ -60,10 +55,9 @@ export async function publishWorkspaceEvent(
 export function attachWss(httpServer: Server): WebSocketServer {
   const wss = new WebSocketServer({ noServer: true });
 
-  // Subscribe to all workspace pub/sub channels on the dedicated subscriber connection
   const sub = getSubRedis();
-  sub.psubscribe('ws:pub:*', (err) => {
-    if (err) console.error('Redis psubscribe error:', err);
+  const subReady = sub.psubscribe('ws:pub:*').catch((err) => {
+    console.error('Redis psubscribe error:', err);
   });
 
   sub.on('pmessage', (_pattern, channel, message) => {
@@ -84,62 +78,62 @@ export function attachWss(httpServer: Server): WebSocketServer {
       if (!client.ready) {
         client.buffer.push({ seq, raw: message });
       } else if (seq > client.lastSentSeq) {
-        client.ws.send(message);
+        client.ws.send(message, { binary: false });
         client.lastSentSeq = seq;
       }
     }
   });
 
-  wss.on('connection', async (ws, req: IncomingMessage & { sbWorkspace?: string; sbAfter?: number }) => {
+  wss.on('connection', (ws, req: IncomingMessage & { sbWorkspace?: string; sbAfter?: number }) => {
     const workspace = req.sbWorkspace!;
     const after = req.sbAfter;
 
     const client: ClientState = {
       ws,
       workspace,
-      ready: false,
+      ready: after === undefined,
       buffer: [],
       lastSentSeq: after ?? 0,
     };
 
-    // Register BEFORE reading history so live events are buffered during ZRANGEBYSCORE
+    // Register synchronously so no live messages are missed
     joinRoom(client);
     ws.on('close', () => leaveRoom(client));
     ws.on('error', () => leaveRoom(client));
 
-    try {
-      if (after !== undefined) {
-        const redis = getRedis();
-        const history = await redis.zrangebyscore(`events:${workspace}`, `(${after}`, '+inf');
-        for (const raw of history) {
-          if (ws.readyState !== WebSocket.OPEN) break;
-          try {
-            const parsed = JSON.parse(raw) as { seq?: number };
-            const seq = typeof parsed.seq === 'number' ? parsed.seq : 0;
-            if (seq > client.lastSentSeq) {
-              ws.send(raw);
-              client.lastSentSeq = seq;
+    if (after !== undefined) {
+      void (async () => {
+        try {
+          const redis = getRedis();
+          const history = await redis.zrangebyscore(`events:${workspace}`, `(${after}`, '+inf');
+          for (const raw of history) {
+            if (ws.readyState !== WebSocket.OPEN) break;
+            try {
+              const parsed = JSON.parse(raw) as { seq?: number };
+              const seq = typeof parsed.seq === 'number' ? parsed.seq : 0;
+              if (seq > client.lastSentSeq) {
+                ws.send(raw, { binary: false });
+                client.lastSentSeq = seq;
+              }
+            } catch {
+              // ignore malformed
             }
-          } catch {
-            // ignore malformed
           }
-        }
-      }
 
-      // Flush any live events buffered while reading history
-      for (const item of client.buffer) {
-        if (ws.readyState !== WebSocket.OPEN) break;
-        if (item.seq > client.lastSentSeq) {
-          ws.send(item.raw);
-          client.lastSentSeq = item.seq;
+          for (const item of client.buffer) {
+            if (ws.readyState !== WebSocket.OPEN) break;
+            if (item.seq > client.lastSentSeq) {
+              ws.send(item.raw, { binary: false });
+              client.lastSentSeq = item.seq;
+            }
+          }
+        } catch (err) {
+          console.error('WS connection replay error:', err);
+        } finally {
+          client.buffer = [];
+          client.ready = true;
         }
-      }
-      client.buffer = [];
-      client.ready = true;
-    } catch (err) {
-      console.error('WS connection replay error:', err);
-      client.buffer = [];
-      client.ready = true;
+      })();
     }
   });
 
@@ -168,6 +162,8 @@ export function attachWss(httpServer: Server): WebSocketServer {
         socket.destroy();
         return;
       }
+
+      await subReady;
 
       req.sbWorkspace = workspace;
       req.sbAfter = after !== undefined && Number.isFinite(after) ? after : undefined;

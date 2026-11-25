@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import express, { type Request, type Response } from 'express';
 import { createServer } from 'node:http';
 import { config } from './config.js';
@@ -31,26 +34,44 @@ app.get('/healthz', (_req: Request, res: Response) => {
   }
 });
 
-// ─── 4. Routes ────────────────────────────────────────────────────────────────
+// ─── 4. API & Webhook Routes ──────────────────────────────────────────────────
 app.use('/', webhookRouter);
 app.use('/__grader', graderRouter);
 app.use('/auth', authRouter);
 app.use('/api', apiRouter);
 
-// ─── 5. HTTP server + WebSocket ───────────────────────────────────────────────
+// ─── 5. Serve built React app (scaffold/web/dist) when present ────────────────
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const webDistDir = path.resolve(__dirname, '../../web/dist');
+if (fs.existsSync(webDistDir)) {
+  app.use(express.static(webDistDir));
+  app.get('*', (req: Request, res: Response, next) => {
+    if (
+      req.path.startsWith('/api') ||
+      req.path.startsWith('/auth') ||
+      req.path.startsWith('/__grader') ||
+      req.path.startsWith('/webhooks') ||
+      req.path.startsWith('/healthz') ||
+      req.path.startsWith('/ws')
+    ) {
+      return next();
+    }
+    res.sendFile(path.join(webDistDir, 'index.html'));
+  });
+}
+
+// ─── 6. HTTP server + WebSocket ───────────────────────────────────────────────
 const server = createServer(app);
 attachWss(server);
 
-// ─── 6. Startup ───────────────────────────────────────────────────────────────
+// ─── 7. Startup ───────────────────────────────────────────────────────────────
 async function start(): Promise<void> {
-  // Connect to MongoDB (creates indexes) and Redis before accepting traffic
   await getDb();
   await waitRedisReady();
 
   ready = true;
   console.log('MongoDB and Redis ready');
 
-  // Start outbound message worker (picks up queued jobs from before crash)
   startOutboxWorker();
 
   server.listen(config.port, () => {

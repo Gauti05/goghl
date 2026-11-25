@@ -1,13 +1,13 @@
 {
   "profile": "full",
-  "startedAt": "2026-11-25T13:57:46.936Z",
+  "startedAt": "2026-11-25T14:07:28.037Z",
   "checks": [
     {
       "level": 1,
       "id": "inbound_complete",
       "max": 4,
       "got": 4,
-      "detail": "178 of 178 genuine messages stored"
+      "detail": "179 of 179 genuine messages stored"
     },
     {
       "level": 1,
@@ -49,7 +49,7 @@
       "id": "ack_speed",
       "max": 1,
       "got": 1,
-      "detail": "p95 acknowledgement 23 ms, 0 first attempts not acknowledged"
+      "detail": "p95 acknowledgement 22 ms, 0 first attempts not acknowledged"
     },
     {
       "level": 1,
@@ -91,7 +91,7 @@
       "id": "crash_inbound_complete",
       "max": 3,
       "got": 3,
-      "detail": "killed at 11 s, down 4 s: 178 of 178 genuine messages stored"
+      "detail": "killed at 9 s, down 4 s: 175 of 175 genuine messages stored"
     },
     {
       "level": 2,
@@ -133,7 +133,7 @@
       "id": "multi_inbound_complete",
       "max": 2,
       "got": 2,
-      "detail": "163 of 163 genuine messages stored"
+      "detail": "178 of 178 genuine messages stored"
     },
     {
       "level": 3,
@@ -216,8 +216,8 @@
       "level": 5,
       "id": "socket_live",
       "max": 3,
-      "got": 2.33,
-      "detail": "4 of 6 new messages arrived on the socket within 5 s; 0 frames from another workspace; seq increasing"
+      "got": 3,
+      "detail": "6 of 6 new messages arrived on the socket within 5 s; 0 frames from another workspace; seq increasing"
     },
     {
       "level": 5,
@@ -227,7 +227,7 @@
       "detail": "4 of 4 messages that arrived while disconnected were replayed after reconnecting with after=6; 0 frames at or before that seq were sent again"
     }
   ],
-  "score": 74.3,
+  "score": 75,
   "max": 75,
   "levels": {
     "1": {
@@ -243,9 +243,9 @@
       "max": 22
     },
     "5": {
-      "got": 14.3,
+      "got": 15,
       "max": 15
     }
   },
-  "finishedAt": "2026-11-25T14:01:20.365Z"
+  "finishedAt": "2026-11-25T14:11:06.864Z"
 }

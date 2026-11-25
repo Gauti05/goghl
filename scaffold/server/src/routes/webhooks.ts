@@ -1,77 +1,28 @@
-import crypto from 'node:crypto';
 import { Router, type Request, type Response } from 'express';
 import { getDb } from '../db.js';
 import { config, KNOWN_WORKSPACES } from '../config.js';
 import { publishWorkspaceEvent } from '../lib/ws.js';
+import { verifyPigeonSignature } from '../lib/pigeonSig.js';
+import { STATUS_RANK, getStatusesBelowRank } from '../lib/statusRank.js';
 
 export const webhookRouter = Router();
-
-// Status rank — higher rank wins; terminal states never downgraded
-const STATUS_RANK: Record<string, number> = {
-  queued: 1,
-  processing: 1,
-  sent: 2,
-  delivered: 3,
-  failed: 3,
-};
 
 // ─── POST /webhooks/pigeon ────────────────────────────────────────────────────
 // MUST be mounted with express.raw({ type: '*/*' }) BEFORE global json middleware.
 webhookRouter.post('/webhooks/pigeon', async (req: Request, res: Response) => {
-  // 1. Extract raw body (express.raw gives us Buffer)
   const rawBody = req.body as Buffer;
   if (!Buffer.isBuffer(rawBody)) {
     res.status(401).json({ error: 'no raw body' });
     return;
   }
 
-  // 2. Parse and verify signature header
-  const sigHeader = req.headers['x-pigeon-signature'];
-  if (!sigHeader || typeof sigHeader !== 'string') {
-    res.status(401).json({ error: 'missing signature' });
-    return;
-  }
-
-  const sigMatch = sigHeader.match(/^t=(\d+),v1=([0-9a-f]+)$/i);
-  if (!sigMatch) {
-    res.status(401).json({ error: 'malformed signature' });
-    return;
-  }
-
-  const t = parseInt(sigMatch[1]!, 10);
-  const providedMac = sigMatch[2]!;
-
-  if (isNaN(t)) {
-    res.status(401).json({ error: 'invalid timestamp' });
-    return;
-  }
-
-  // 3. Enforce 5-minute timestamp window
-  const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - t) > 300) {
-    res.status(401).json({ error: 'timestamp too old or too far in future' });
-    return;
-  }
-
-  // 4. HMAC-SHA256 verification using raw body bytes
-  const expectedMac = crypto
-    .createHmac('sha256', config.pigeon.webhookSecret)
-    .update(`${t}.`)
-    .update(rawBody)
-    .digest('hex');
-
-  let macValid = false;
-  try {
-    macValid = crypto.timingSafeEqual(
-      Buffer.from(expectedMac, 'hex'),
-      Buffer.from(providedMac.toLowerCase(), 'hex'),
-    );
-  } catch {
-    // length mismatch — invalid
-  }
-
-  if (!macValid) {
-    res.status(401).json({ error: 'signature mismatch' });
+  const sigCheck = verifyPigeonSignature(
+    req.headers['x-pigeon-signature'],
+    rawBody,
+    config.pigeon.webhookSecret,
+  );
+  if (!sigCheck.ok) {
+    res.status(401).json({ error: sigCheck.reason });
     return;
   }
 
@@ -296,10 +247,4 @@ function isDuplicateKeyError(err: unknown): boolean {
     'code' in err &&
     (err as { code: number }).code === 11000
   );
-}
-
-function getStatusesBelowRank(rank: number): string[] {
-  return Object.entries(STATUS_RANK)
-    .filter(([, r]) => r < rank)
-    .map(([s]) => s);
 }
